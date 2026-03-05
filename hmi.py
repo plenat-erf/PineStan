@@ -14,6 +14,9 @@ from typing import Any
 HOST = "127.0.0.1"
 PORT = 8765
 POLL_MS = 500
+DASH_PATTERN = (10, 6)
+DASH_CYCLE_PX = sum(DASH_PATTERN)
+FLOW_LIMITS = {"feed": 18.0, "vapor": 5.0, "cool": 55.0}
 
 CONTROL_ORDER = [
     ("flask_temp_sp_c", "Flask Temp SP (°C)", 65, 102),
@@ -50,13 +53,13 @@ class DistillationGUI:
         self.status_var = tk.StringVar(value="Connecting to simulator...")
         self.state: dict[str, float] = {}
         self.controls: dict[str, float] = {k: float(lo) for k, _, lo, _ in CONTROL_ORDER}
-        self.phase = {"feed": 0.0, "vapor": 0.0, "cool": 0.0}
+        self.flow_offset_px = {"feed": 0.0, "vapor": 0.0, "cool": 0.0}
         self.last_anim_ts = time.time()
         self.updating_scales = False
 
         self._build_layout()
         self.root.after(200, self.poll_simulator)
-        self.root.after(100, self.animate_flows)
+        self.root.after(80, self.animate_flows)
 
     def _maximize_window(self) -> None:
         try:
@@ -183,21 +186,27 @@ class DistillationGUI:
                 val *= 100.0
             label.configure(text=self.sensor_formats[key].format(val))
 
+    def _advance_offset(self, flow_key: str, flow_lpm: float, dt_s: float) -> None:
+        max_flow = FLOW_LIMITS[flow_key]
+        flow_frac = max(0.0, min(1.0, flow_lpm / max_flow))
+        min_speed_px_s = 2.0
+        max_speed_px_s = 68.0
+        px_per_s = min_speed_px_s + (max_speed_px_s - min_speed_px_s) * flow_frac
+        if flow_lpm <= 0.01:
+            px_per_s = 0.0
+        self.flow_offset_px[flow_key] = (self.flow_offset_px[flow_key] + (px_per_s * dt_s)) % DASH_CYCLE_PX
+
     def animate_flows(self) -> None:
         now = time.time()
-        dt_s = max(0.02, now - self.last_anim_ts)
+        dt_s = max(0.01, now - self.last_anim_ts)
         self.last_anim_ts = now
 
-        feed = self.state.get("feed_line_flow_lpm", 0.0)
-        vapor = self.state.get("vaporization_rate_lpm", 0.0)
-        cool = self.state.get("cooling_flow_lpm", 0.0)
-
-        self.phase["feed"] += feed * dt_s * 10.0
-        self.phase["vapor"] += vapor * dt_s * 18.0
-        self.phase["cool"] += cool * dt_s * 3.8
+        self._advance_offset("feed", self.state.get("feed_line_flow_lpm", 0.0), dt_s)
+        self._advance_offset("vapor", self.state.get("vaporization_rate_lpm", 0.0), dt_s)
+        self._advance_offset("cool", self.state.get("cooling_flow_lpm", 0.0), dt_s)
 
         self.draw_process()
-        self.root.after(100, self.animate_flows)
+        self.root.after(80, self.animate_flows)
 
     def tank_level_ratio(self, name: str, cap: float) -> float:
         return max(0.0, min(1.0, self.state.get(name, 0.0) / cap))
@@ -247,18 +256,32 @@ class DistillationGUI:
         self.canvas.create_text(x + w // 2, y - 12, text=label, fill="#f0f0f0")
         self.canvas.create_text(x + w // 2, y + h + 28, text=f"{temp_c:.1f}°C", fill="#f0f0f0")
 
-    def draw_pipe(self, points: list[tuple[int, int]], color: str, phase: float) -> None:
+    def draw_pipe(self, points: list[tuple[int, int]], color: str, offset_px: float) -> None:
         flat = [coord for pt in points for coord in pt]
         self.canvas.create_line(*flat, fill="#3c4a5c", width=8, capstyle=tk.ROUND, joinstyle=tk.ROUND)
         self.canvas.create_line(
             *flat,
             fill=color,
             width=4,
-            dash=(10, 6),
-            dashoffset=-phase,
+            dash=DASH_PATTERN,
+            dashoffset=-offset_px,
             capstyle=tk.ROUND,
             joinstyle=tk.ROUND,
         )
+
+    def draw_column_with_jacket(self) -> None:
+        # Siemens-like representation: center vapor path with dual cooling jacket returns
+        center_x = 745
+        top_y = 120
+        bottom_y = 345
+        left_jacket = 718
+        right_jacket = 772
+
+        self.canvas.create_rectangle(left_jacket, top_y, right_jacket, bottom_y, outline="#e9e9e9", width=2)
+        self.canvas.create_line(center_x, top_y + 8, center_x, bottom_y - 8, fill="#ffd86b", width=6)
+        self.canvas.create_line(left_jacket + 6, top_y + 8, left_jacket + 6, bottom_y - 8, fill="#73d8ff", width=4)
+        self.canvas.create_line(right_jacket - 6, top_y + 8, right_jacket - 6, bottom_y - 8, fill="#73d8ff", width=4)
+        self.canvas.create_text(center_x, 104, text="Distillation Column + Cooling Jacket", fill="#f0f0f0")
 
     def draw_process(self) -> None:
         c = self.canvas
@@ -278,29 +301,36 @@ class DistillationGUI:
         self.canvas.create_text(490, 126, text="Distillation Flask", fill="#f0f0f0")
         self.draw_thermometer(570, 190, self.state.get("flask_temp_c", 0.0), "Flask Temp")
 
-        self.canvas.create_rectangle(710, 120, 780, 330, outline="#f0f0f0", width=2)
-        self.canvas.create_text(745, 106, text="Column", fill="#f0f0f0")
+        self.draw_column_with_jacket()
 
         self.draw_tank(890, 120, 1010, 340, coll_ratio, "Collection Tank", "#7ad97a")
         self.draw_thermometer(1020, 190, self.state.get("collection_temp_c", 0.0), "Collection Temp", 80.0)
 
         self.draw_pump_tacho(320, 520, self.state.get("cooling_pump_speed", 0.0), "Cooling Pump")
-        self.draw_thermometer(740, 470, self.state.get("cooling_inlet_temp_c", 0.0), "Cooling In", 50.0)
+        self.draw_thermometer(700, 470, self.state.get("cooling_inlet_temp_c", 0.0), "Cooling In", 50.0)
         self.draw_thermometer(790, 470, self.state.get("cooling_outlet_temp_c", 0.0), "Cooling Out", 50.0)
 
-        self.draw_pipe([(180, 230), (213, 230)], "#7ec8ff", self.phase["feed"])
-        self.draw_pipe([(257, 230), (285, 230)], "#7ec8ff", self.phase["feed"])
-        self.draw_pipe([(355, 230), (420, 230)], "#7ec8ff", self.phase["feed"])
-        self.draw_pipe([(560, 180), (710, 180)], "#ffd86b", self.phase["vapor"])
-        self.draw_pipe([(780, 220), (890, 220)], "#9ff58f", self.phase["vapor"])
+        self.draw_pipe([(180, 230), (213, 230)], "#7ec8ff", self.flow_offset_px["feed"])
+        self.draw_pipe([(257, 230), (285, 230)], "#7ec8ff", self.flow_offset_px["feed"])
+        self.draw_pipe([(355, 230), (420, 230)], "#7ec8ff", self.flow_offset_px["feed"])
+        self.draw_pipe([(560, 180), (745, 180)], "#ffd86b", self.flow_offset_px["vapor"])
+        self.draw_pipe([(745, 220), (890, 220)], "#9ff58f", self.flow_offset_px["vapor"])
 
-        self.draw_pipe([(80, 520), (285, 520)], "#73d8ff", self.phase["cool"])
-        self.draw_pipe([(355, 520), (680, 520), (680, 300), (710, 300)], "#73d8ff", self.phase["cool"])
-        self.draw_pipe([(780, 300), (840, 300), (840, 520), (1060, 520)], "#73d8ff", self.phase["cool"])
+        self.draw_pipe([(80, 520), (285, 520)], "#73d8ff", self.flow_offset_px["cool"])
+        self.draw_pipe([(355, 520), (690, 520), (690, 140), (724, 140)], "#73d8ff", self.flow_offset_px["cool"])
+        self.draw_pipe([(355, 520), (800, 520), (800, 140), (766, 140)], "#73d8ff", self.flow_offset_px["cool"])
+        self.draw_pipe([(724, 345), (690, 345), (690, 560), (980, 560)], "#73d8ff", self.flow_offset_px["cool"])
+        self.draw_pipe([(766, 345), (800, 345), (800, 560), (1060, 560)], "#73d8ff", self.flow_offset_px["cool"])
 
         self.canvas.create_text(80, 500, text="Water Intake", fill="#d7ecff")
-        self.canvas.create_text(1060, 540, text="Waste Water Outlet", fill="#d7ecff")
-        self.canvas.create_text(500, 26, text="Distillation Process", fill="#ffffff", font=("TkDefaultFont", 14, "bold"))
+        self.canvas.create_text(1060, 582, text="Waste Water Outlet", fill="#d7ecff")
+        self.canvas.create_text(
+            540,
+            30,
+            text="Distillation Process - SCADA Overview",
+            fill="#ffffff",
+            font=("TkDefaultFont", 14, "bold"),
+        )
 
 
 def main() -> None:

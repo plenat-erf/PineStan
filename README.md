@@ -17,30 +17,32 @@ Cooling process line:
 
 ## Control structure
 
-The operator now sets only high-level setpoints:
+The operator sets high-level setpoints:
 
 - **Flask temperature setpoint** (°C)
 - **Flask level setpoint** (L)
 
-The simulator uses internal PID loops to automatically drive:
+Internal PID loops in the simulator automatically manipulate:
 
 - Feed valve position
 - Feed pump speed
 - Heater power
 - Cooling pump speed
 
-These manipulated variables are fed back to the GUI as live actuator values.
+These manipulated variables are fed back to the GUI as live actuator readings.
 
-## GUI visuals
+## GUI visuals (Siemens-inspired)
 
-The GUI displays SCADA symbols and live dynamics:
+The GUI renders a darker industrial SCADA canvas with simplified PFD symbols:
 
-- Tanks with level infill
-- Valve open/closed state symbol
-- Pump tachometers
-- Thermometer graphics
-- Animated dashed flow in pipes, with animation speed proportional to actual flow rate
-- Maximized startup window for full-screen operator view
+- Tanks with live infill levels
+- Valve open/closed symbol
+- Pump tachometer indicators
+- Thermometer bars
+- Distillation column drawn with a central distillate path and side cooling-jacket paths
+- Cooling lines split to each side of the column jacket and rejoin at the outlet
+- Animated dashed flow in each process stream, with dash speed proportional to that stream's actual flow rate
+- Maximized startup window for full-screen operator use
 
 ## Run
 
