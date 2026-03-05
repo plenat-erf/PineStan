@@ -20,14 +20,18 @@ PORT = 8765
 
 @dataclass
 class Controls:
-    feed_valve: float = 0.4
-    feed_pump_speed: float = 0.35
-    heating_power: float = 0.45
-    cooling_pump_speed: float = 0.55
+    flask_temp_sp_c: float = 85.0
+    flask_level_sp_l: float = 85.0
 
     def clamp(self) -> None:
-        for key in ("feed_valve", "feed_pump_speed", "heating_power", "cooling_pump_speed"):
-            setattr(self, key, max(0.0, min(1.0, float(getattr(self, key)))))
+        self.flask_temp_sp_c = max(65.0, min(102.0, float(self.flask_temp_sp_c)))
+        self.flask_level_sp_l = max(20.0, min(230.0, float(self.flask_level_sp_l)))
+
+
+@dataclass
+class PIDState:
+    i_term: float = 0.0
+    prev_err: float = 0.0
 
 
 @dataclass
@@ -46,6 +50,10 @@ class ProcessState:
     cooling_flow_lpm: float
     collection_level_l: float
     collection_temp_c: float
+    feed_valve: float
+    feed_pump_speed: float
+    heating_power: float
+    cooling_pump_speed: float
 
 
 class PlantSimulator:
@@ -73,6 +81,14 @@ class PlantSimulator:
         self.vaporization_rate_lpm = 0.0
         self.cooling_flow_lpm = 0.0
 
+        self.feed_valve = 0.35
+        self.feed_pump_speed = 0.35
+        self.heating_power = 0.45
+        self.cooling_pump_speed = 0.55
+
+        self.level_pid = PIDState()
+        self.temp_pid = PIDState()
+
         self.max_feed_flow_lpm = 18.0
         self.max_cooling_flow_lpm = 55.0
         self.max_vaporization_lpm = 5.0
@@ -90,6 +106,17 @@ class PlantSimulator:
         density_ethanol = 0.789
         return (1.0 - ethanol_frac) * density_water + ethanol_frac * density_ethanol
 
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _pid(self, state: PIDState, error: float, dt_s: float, kp: float, ki: float, kd: float) -> float:
+        state.i_term += error * dt_s
+        state.i_term = max(-400.0, min(400.0, state.i_term))
+        d_err = (error - state.prev_err) / max(1e-6, dt_s)
+        state.prev_err = error
+        return kp * error + ki * state.i_term + kd * d_err
+
     def snapshot(self) -> ProcessState:
         return ProcessState(
             timestamp=time.time(),
@@ -106,6 +133,10 @@ class PlantSimulator:
             cooling_flow_lpm=self.cooling_flow_lpm,
             collection_level_l=self.collection_level_l,
             collection_temp_c=self.collection_temp_c,
+            feed_valve=self.feed_valve,
+            feed_pump_speed=self.feed_pump_speed,
+            heating_power=self.heating_power,
+            cooling_pump_speed=self.cooling_pump_speed,
         )
 
     def set_controls(self, updates: dict[str, float]) -> None:
@@ -125,11 +156,26 @@ class PlantSimulator:
         alpha = 1.0 - math.exp(-dt_s / 420.0)
         self.cooling_inlet_temp_c += (target - self.cooling_inlet_temp_c) * alpha
 
+    def _run_control_loops(self, dt_s: float) -> None:
+        lvl_err = self.controls.flask_level_sp_l - self.flask_level_l
+        lvl_u = self._pid(self.level_pid, lvl_err, dt_s, kp=0.028, ki=0.0035, kd=0.01)
+        level_demand = self._clamp01(lvl_u)
+        self.feed_valve = level_demand
+        self.feed_pump_speed = 0.2 + 0.8 * level_demand
+
+        temp_err = self.controls.flask_temp_sp_c - self.flask_temp_c
+        heat_u = self._pid(self.temp_pid, temp_err, dt_s, kp=0.045, ki=0.0035, kd=0.008)
+        self.heating_power = self._clamp01(heat_u)
+
+        cooling_bias = max(0.0, self.flask_temp_c - self.controls.flask_temp_sp_c)
+        self.cooling_pump_speed = self._clamp01(0.12 + 0.88 * cooling_bias / 12.0)
+
     def step(self, dt_s: float) -> None:
         dt_min = dt_s / 60.0
         self._update_cooling_source(dt_s)
+        self._run_control_loops(dt_s)
 
-        self.feed_line_flow_lpm = self.max_feed_flow_lpm * self.controls.feed_valve * self.controls.feed_pump_speed
+        self.feed_line_flow_lpm = self.max_feed_flow_lpm * self.feed_valve * self.feed_pump_speed
         feed_transfer_l = min(self.feedstock_level_l, self.feed_line_flow_lpm * dt_min)
         free_flask_l = max(0.0, self.flask_capacity_l - self.flask_level_l)
         feed_transfer_l = min(feed_transfer_l, free_flask_l)
@@ -141,10 +187,10 @@ class PlantSimulator:
             )
             self.flask_level_l += feed_transfer_l
 
-        self.cooling_flow_lpm = self.max_cooling_flow_lpm * self.controls.cooling_pump_speed
+        self.cooling_flow_lpm = self.max_cooling_flow_lpm * self.cooling_pump_speed
 
-        heating_term = 3.9 * self.controls.heating_power
-        cooling_term = 1.7 * self.controls.cooling_pump_speed + max(0.0, self.cooling_inlet_temp_c - 25.0) * 0.08
+        heating_term = 3.9 * self.heating_power
+        cooling_term = 1.7 * self.cooling_pump_speed + max(0.0, self.cooling_inlet_temp_c - 25.0) * 0.08
         temp_target = 26.0 + 80.0 * max(0.0, heating_term - cooling_term)
         temp_alpha = 1.0 - math.exp(-dt_s / 200.0)
         self.flask_temp_c += (temp_target - self.flask_temp_c) * temp_alpha
@@ -153,12 +199,12 @@ class PlantSimulator:
         ethanol_boost = 0.25 + self.flask_ethanol_frac
         self.vaporization_rate_lpm = min(
             self.max_vaporization_lpm,
-            self.controls.heating_power * temp_drive * ethanol_boost * self.max_vaporization_lpm,
+            self.heating_power * temp_drive * ethanol_boost * self.max_vaporization_lpm,
         )
 
         boil_off_l = min(self.flask_level_l, self.vaporization_rate_lpm * dt_min)
 
-        condenser_eff = 0.18 + 0.8 * self.controls.cooling_pump_speed - max(0.0, self.cooling_inlet_temp_c - 25.0) * 0.015
+        condenser_eff = 0.18 + 0.8 * self.cooling_pump_speed - max(0.0, self.cooling_inlet_temp_c - 25.0) * 0.015
         condenser_eff = max(0.05, min(0.98, condenser_eff))
         condensed_l = boil_off_l * condenser_eff
 
